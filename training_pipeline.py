@@ -21,11 +21,7 @@ from sklearn.model_selection import RandomizedSearchCV
 # Definimos el primer task que es actualizar el dataset
 @task(name="Actualilzar dataset")
 def actualizar_dataset(jornada:int) -> pd.DataFrame:
-    import pandas as pd
-    import re
 
-    ## Seleccionamos el numero de jornada
-    jornada = 11
     url = "https://fbref.com/es/comps/12/horario/Resultados-y-partidos-en-La-Liga"
     tables = pd.read_html(url)
     df = tables[0]
@@ -344,7 +340,7 @@ def comparar_modelos(resultados):
 @flow(name="Pipeline de Entrenamiento y Registro de Modelos")
 def pipeline_entrenamiento(jornada_actual: int):
     # Inicializamos MLflow y DagsHub
-    dagshub.init(repo_owner='tu_usuario', repo_name='tu_repo', mlflow=True)
+    dagshub.init(url="https://dagshub.com/arturotowers/Proyecto_LaLiga", mlflow=True)
     mlflow.set_experiment("LaLiga_Experiment")
 
     # Actualizamos el dataset con los resultados de la jornada pasada
@@ -394,6 +390,6 @@ def pipeline_entrenamiento(jornada_actual: int):
     comparar_modelos(resultados)
 
 if __name__ == "__main__":
-    pipeline_entrenamiento(jornada_actual=12)
+    pipeline_entrenamiento(jornada_actual=13)
 
 
