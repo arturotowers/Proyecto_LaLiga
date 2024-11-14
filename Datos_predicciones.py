@@ -1,5 +1,12 @@
 import pandas as pd
 import re
+import dagshub
+import mlflow
+dagshub.init(url="https://dagshub.com/JuanPab2009/ProyectoFinalCD", mlflow=True)
+# mlflow.set_tracking_uri("https://dagshub.com/JuanPab2009/ProyectoFinalCD.mlflow")
+
+# mlflow.set_experiment(experiment_name="nyc-taxi-experiment-prefect")
+
 # Seleccionamos el número de la jornada
 jornada = 12
 
@@ -96,4 +103,22 @@ df_opp.rename(columns=dict(zip(columns_to_rename, new_column_names_opp)), inplac
 df = pd.merge(df, df_opp, left_on='Adversario', right_on='Equipo', how='left')
 df = pd.merge(df, df_tm, left_on='Anfitrion', right_on='Equipo', how='left')
 df=df.drop(['Equipo_x','Equipo_y'],axis=1)
-df.head()
+
+predicted_df=df[['Día','Sedes','Edad(opp)','Pos.(opp)', 'Ass(opp)', 'TPint(opp)',
+      'PrgC(opp)', 'PrgP(opp)','% de TT(opp)', 'Dist(opp)', '% Cmp(opp)', 'Dist. tot.(opp)','TklG(opp)', 'Int(opp)',
+      'Err(opp)', 'RL(opp)', 'PG(opp)', 'PE(opp)','PP(opp)', 'GF(opp)', 'GC(opp)', 'xG(opp)', 'xGA(opp)','Últimos 5(opp)',
+      'Máximo Goleador del Equipo(opp)', 'Edad(tm)', 'Pos.(tm)', 'Ass(tm)', 'TPint(tm)', 'PrgC(tm)', 'PrgP(tm)',
+      '% de TT(tm)', 'Dist(tm)', '% Cmp(tm)', 'Dist. tot.(tm)', 'TklG(tm)','Int(tm)', 'Err(tm)', 'RL(tm)', 'PG(tm)',
+      'PE(tm)', 'PP(tm)', 'GF(tm)','GC(tm)', 'xG(tm)', 'xGA(tm)', 'Últimos 5(tm)','Máximo Goleador del Equipo(tm)']]
+
+logged_model = 'runs:/e8e41ab35bd34545a81ccb039080a64c/model'
+
+# Load model as a PyFuncModel.
+loaded_model = mlflow.pyfunc.load_model(logged_model)
+
+# Predict on a Pandas DataFrame.
+import pandas as pd
+a = pd.DataFrame(loaded_model.predict(pd.DataFrame(predicted_df)))
+# a['Anfitrion']=df['Anfitrion']
+# a['Rival']=df['Adversario']
+print(a)
