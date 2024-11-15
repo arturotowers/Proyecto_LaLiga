@@ -119,6 +119,6 @@ loaded_model = mlflow.pyfunc.load_model(logged_model)
 # Predict on a Pandas DataFrame.
 import pandas as pd
 a = pd.DataFrame(loaded_model.predict(pd.DataFrame(predicted_df)))
-# a['Anfitrion']=df['Anfitrion']
-# a['Rival']=df['Adversario']
+a['Anfitrion']=df['Anfitrion']
+a['Rival']=df['Adversario']
 print(a)
