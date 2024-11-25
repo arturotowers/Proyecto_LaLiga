@@ -2,26 +2,26 @@
 import pandas as pd
 import re
 import pickle
-import mlflow
 import dagshub
 import pathlib
-import numpy as np
-
+from mlflow.metrics import precision_score, recall_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
-from xgboost import XGBClassifier
-from sklearn.svm import SVC
-from sklearn.metrics import accuracy_score, f1_score
-
 from prefect import task, flow
 from mlflow.tracking import MlflowClient
-from sklearn.model_selection import RandomizedSearchCV
+from hyperopt import fmin, tpe, hp, Trials, STATUS_OK
+from hyperopt.pyll import scope
+from xgboost import XGBClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+import mlflow
+import mlflow.xgboost
+
 
 # Definimos el primer task que es actualizar el dataset
 @task(name="Actualilzar dataset")
-def actualizar_dataset(jornada:int) -> pd.DataFrame:
-
+def actualizar_dataset(file_path,jornada_actual) -> pd.DataFrame:
+    jornada = jornada_actual -1
     url = "https://fbref.com/es/comps/12/horario/Resultados-y-partidos-en-La-Liga"
     tables = pd.read_html(url)
     df = tables[0]
@@ -129,22 +129,19 @@ def actualizar_dataset(jornada:int) -> pd.DataFrame:
     df = pd.merge(df, df_tm, left_on='Anfitrion', right_on='Equipo', how='left')
     df = df.drop(['Equipo_x', 'Equipo_y'], axis=1)
     # Nombre del archivo Excel y de la hoja
-    archivo_excel = 'LaLiga Dataset 2023-2024.xlsx'
+    file_path = 'LaLiga Dataset 2023-2024.xlsx'
 
-    df_existente = pd.read_excel(archivo_excel)
+    df_existente = pd.read_excel(file_path)
 
     df = pd.concat([df_existente, df], ignore_index=True)
-    df.to_excel(archivo_excel, index=False)
+    df.to_excel(file_path, index=False)
 
     return df
 
 # Definimos el segundo task que es preparar los datos para las predicciones
 @task(name="Preparar Datos para Predicciones")
-def preparar_datos_prediccion(jornada: int) -> pd.DataFrame:
-    import pandas as pd
-    import re
-    # Seleccionamos el número de la jornada
-    jornada = 12
+def preparar_datos_prediccion(jornada_actual: int) -> pd.DataFrame:
+    jornada = jornada_actual
 
     url = "https://fbref.com/es/comps/12/horario/Resultados-y-partidos-en-La-Liga"
     tables = pd.read_html(url)
@@ -245,11 +242,8 @@ def preparar_datos_prediccion(jornada: int) -> pd.DataFrame:
     df_prediccion = df
 
     return df_prediccion
-
-# Definimos el task para cargar y preprocesar los datos
 @task(name="Cargar y Procesar Dataset")
-def cargar_procesar_dataset() -> tuple:
-    df = pd.read_excel('LaLiga_Dataset_2023_2024.xlsx')
+def cargar_procesar_dataset(df):
 
     X = df[['Día','Sedes','Edad(opp)','Pos.(opp)', 'Ass(opp)', 'TPint(opp)',
       'PrgC(opp)', 'PrgP(opp)','% de TT(opp)', 'Dist(opp)', '% Cmp(opp)', 'Dist. tot.(opp)','TklG(opp)', 'Int(opp)',
@@ -259,137 +253,239 @@ def cargar_procesar_dataset() -> tuple:
       'PE(tm)', 'PP(tm)', 'GF(tm)','GC(tm)', 'xG(tm)', 'xGA(tm)', 'Últimos 5(tm)','Máximo Goleador del Equipo(tm)']]
     y = df['Resultado']
 
+    # Ajustar las etiquetas de las clases en y
+    y = y - 1
+
     # Dividimos en conjuntos de entrenamiento y prueba
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=15)
+    X_train, X_val, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=15)
 
     # Escalar los datos
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_val_scaled = scaler.transform(X_val)
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_val)
 
     # Guardamos el scaler
     pathlib.Path("models").mkdir(exist_ok=True)
     with open("models/scaler.pkl", "wb") as f_out:
         pickle.dump(scaler, f_out)
 
-    return X_train_scaled, X_val_scaled, y_train, y_val
+    return X_train, X_test, y_train, y_test
 
 # Creamos el task para entrenar los modelos
-@task(name="Entrenar Modelo")
-def entrenar_modelo(X_train, X_val, y_train, y_val, model_class, model_name, param_distributions, n_iter=10):
-    with mlflow.start_run(run_name=model_name):
-        # Realizamos la búsqueda de hiperparámetros
-        search = RandomizedSearchCV(
-            estimator=model_class(),
-            param_distributions=param_distributions,
-            n_iter=n_iter,
-            scoring='accuracy',
-            n_jobs=-1,
-            cv=3,
-            random_state=42
+@task(name = "Hyper-Parameter Tunning")
+def hyper_parameter_tunning(X_train, X_test, y_train, y_test):
+    def objective_xgb(params):
+        with mlflow.start_run(nested=True):
+            mlflow.set_tag("model_family", "XGBoost-prefect")
+            mlflow.log_params(params)
+
+            # Entrenamos el modelo XGBoost con los parámetros proporcionados
+            model = XGBClassifier(**params, use_label_encoder=False, eval_metric='logloss', random_state=42)
+            model.fit(X_train, y_train)
+
+            # Realizamos las predicciones
+            y_pred = model.predict(X_test)
+
+            # Calculamos las métricas
+            accuracy = accuracy_score(y_test, y_pred)
+            precision = precision_score(y_test, y_pred, average='weighted')
+            recall = recall_score(y_test, y_pred, average='weighted')
+
+            # Registramos las métricas en MLflow
+            mlflow.log_metric("accuracy", accuracy)
+            mlflow.log_metric("precision", precision)
+            mlflow.log_metric("recall", recall)
+
+            # Registramos el modelo en MLflow
+            mlflow.xgboost.log_model(model, artifact_path="model-xgb")
+            mlflow.log_artifact("models/scaler.pkl", artifact_path="scaler")
+
+            # La función objetivo devuelve la pérdida como negativa de la precisión
+            return {'loss': -accuracy, 'status': STATUS_OK}
+
+    # Espacio de búsqueda para la optimización de hiperparámetros
+    search_space_xgb = {
+        'n_estimators': scope.int(hp.quniform('n_estimators', 100, 500, 1)),
+        'max_depth': scope.int(hp.quniform('max_depth', 3, 10, 1)),
+        'learning_rate': hp.loguniform('learning_rate', -3, 0),  # Entre 0.001 y 1
+        'subsample': hp.uniform('subsample', 0.5, 1.0),
+        'colsample_bytree': hp.uniform('colsample_bytree', 0.5, 1.0),
+        'gamma': hp.uniform('gamma', 0, 5),
+        'min_child_weight': scope.int(hp.quniform('min_child_weight', 1, 10, 1))
+    }
+
+    # Ejecutamos la optimización
+    with mlflow.start_run(run_name="XGBoost Hyper-parameter Optimization"):
+        best_params_xgb = fmin(
+            fn=objective_xgb,
+            space=search_space_xgb,
+            algo=tpe.suggest,
+            max_evals=10,
+            trials=Trials()
         )
-        search.fit(X_train, y_train)
-        best_model = search.best_estimator_
-        y_pred = best_model.predict(X_val)
 
-        # Calculamos métricas
-        accuracy = accuracy_score(y_val, y_pred)
-        f1 = f1_score(y_val, y_pred, average='weighted')
+        # Convertir parámetros al formato adecuado
+        best_params_xgb['n_estimators'] = int(best_params_xgb['n_estimators'])
+        best_params_xgb['max_depth'] = int(best_params_xgb['max_depth'])
+        best_params_xgb['min_child_weight'] = int(best_params_xgb['min_child_weight'])
+        mlflow.log_params(best_params_xgb)
 
-        # Registramos métricas y parámetros en MLflow
-        mlflow.log_metric("accuracy", accuracy)
-        mlflow.log_metric("f1_score", f1)
-        mlflow.log_params(search.best_params_)
+    def objective_rf(params):
+        with mlflow.start_run(nested=True):
+            mlflow.set_tag("model_family", "RandomForest-prefect")
+            mlflow.log_params(params)
 
-        # Guardamos el modelo
-        mlflow.sklearn.log_model(best_model, artifact_path="models")
+            model = RandomForestClassifier(**params, random_state=42)
+            model.fit(X_train, y_train)
 
-        # Obtenemos el run_id
-        run_id = mlflow.active_run().info.run_id
+            y_pred = model.predict(X_test)
+            accuracy = accuracy_score(y_test, y_pred)
+            precision = precision_score(y_test, y_pred, average='weighted')
+            recall = recall_score(y_test, y_pred, average='weighted')
 
-        return accuracy, run_id, model_name
+            mlflow.log_metric("accuracy", accuracy)
+            mlflow.log_metric("precision", precision)
+            mlflow.log_metric("recall", recall)
+            mlflow.sklearn.log_model(model, artifact_path="model-rf")
+            mlflow.log_artifact("models/scaler.pkl", artifact_path="scaler")
+
+        return {'loss': -accuracy, 'status': STATUS_OK}
+
+    with mlflow.start_run(run_name="RandomForest Hyper-parameter Optimization"):
+        search_space_rf = {
+            'n_estimators': scope.int(hp.quniform('n_estimators', 100, 500, 1)),
+            'max_depth': scope.int(hp.quniform('max_depth', 5, 50, 1)),
+            'min_samples_split': scope.int(hp.quniform('min_samples_split', 2, 10, 1)),
+            'min_samples_leaf': scope.int(hp.quniform('min_samples_leaf', 1, 4, 1)),
+            'bootstrap': hp.choice('bootstrap', [True, False])
+        }
+
+        best_params_rf = fmin(
+            fn=objective_rf,
+            space=search_space_rf,
+            algo=tpe.suggest,
+            max_evals=10,
+            trials=Trials()
+        )
+
+        # Convertir parámetros al formato adecuado
+        best_params_rf['n_estimators'] = int(best_params_rf['n_estimators'])
+        best_params_rf['max_depth'] = int(best_params_rf['max_depth'])
+        best_params_rf['min_samples_split'] = int(best_params_rf['min_samples_split'])
+        best_params_rf['min_samples_leaf'] = int(best_params_rf['min_samples_leaf'])
+        best_params_rf['bootstrap'] = bool(best_params_rf['bootstrap'])
+        mlflow.log_params(best_params_rf)
+
+        return best_params_xgb, best_params_rf
+
 # Creamos el task para registrar modelos en el model registry
-@task(name="Registrar Modelo")
-def registrar_modelo(run_id, model_name, alias):
-    client = MlflowClient()
-    model_uri = f"runs:/{run_id}/models"
-    model_version = mlflow.register_model(model_uri, model_name)
-    client.set_registered_model_alias(model_name, alias, model_version.version)
-    return model_version.version
+@task(name="Train best model")
+def train_best_model(X_train, X_test, y_train, y_test, best_params_xgb, best_params_rf) -> None:
+    with mlflow.start_run(run_name="Best lr model ever"):
+        best_model_xgb = XGBClassifier(**best_params_xgb, random_state=42)
+        best_model_xgb.fit(X_train, y_train)
+
+        y_pred_xgb = best_model_xgb.predict(X_test)
+        accuracy_xgb = accuracy_score(y_test, y_pred_xgb)
+        precision_xgb = precision_score(y_test, y_pred_xgb, average='weighted')
+        recall_xgb = recall_score(y_test, y_pred_xgb, average='weighted')
+
+        mlflow.log_metric("accuracy", accuracy_xgb)
+        mlflow.log_metric("precision", precision_xgb)
+        mlflow.log_metric("recall", recall_xgb)
+
+    with mlflow.start_run(run_name="Best rf model ever"):
+        best_model_rf = RandomForestClassifier(**best_params_rf, random_state=42)
+        best_model_rf.fit(X_train, y_train)
+
+        y_pred_rf = best_model_rf.predict(X_test)
+        accuracy_rf = accuracy_score(y_test, y_pred_rf)
+        precision_rf = precision_score(y_test, y_pred_rf, average='weighted')
+        recall_rf = recall_score(y_test, y_pred_rf, average='weighted')
+
+        mlflow.log_metric("accuracy", accuracy_rf)
+        mlflow.log_metric("precision", precision_rf)
+        mlflow.log_metric("recall", recall_rf)
+
+
+    pathlib.Path("models").mkdir(exist_ok=True)
+    mlflow.log_artifact("models/scaler.pkl", artifact_path="scaler")
+
+    return None
+
 
 # Creamos el task para comparar los modelos y asignar los alías
 @task(name="Comparar Modelos y Asignar Alias")
-def comparar_modelos(resultados):
-    # resultados es una lista de tuplas (accuracy, run_id, model_name)
-    # Ordenamos por accuracy descendente
-    resultados_ordenados = sorted(resultados, key=lambda x: x[0], reverse=True)
+def register_best_model():
+    client = MlflowClient()
 
-    # El mejor modelo es el "champion"
-    champion_accuracy, champion_run_id, champion_model_name = resultados_ordenados[0]
-    # El segundo mejor es el "challenger"
-    challenger_accuracy, challenger_run_id, challenger_model_name = resultados_ordenados[1]
+    # Declaramos el experimento en el que estamos trabajando
+    experiment_name = "arturo-prefect-experiment"
 
-    # Registramos modelos y asignamos su alias
-    champion_version = registrar_modelo(champion_run_id, "LaLiga_Model", "champion")
-    challenger_version = registrar_modelo(challenger_run_id, "LaLiga_Model", "challenger")
+    experiment = client.get_experiment_by_name(experiment_name)
 
-    print(f"Champion model: {champion_model_name} (version {champion_version}), Accuracy: {champion_accuracy}")
-    print(f"Challenger model: {challenger_model_name} (version {challenger_version}), Accuracy: {challenger_accuracy}")
+    # Buscamos las dos mejores ejecuciones en base al accuracy
+    top_runs = mlflow.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        order_by=["metrics.accuracy DESC"],  # Cambia a ASC si buscas minimizar
+        max_results=2  # Recuperar las dos mejores
+    )
+
+    # Obtenemos los IDs de las mejores ejecuciones
+    champion_run = top_runs.iloc[0]
+    challenger_run = top_runs.iloc[1]
+
+    # Obtenemos los IDs de las ejecuciones
+    champion_run_id = champion_run.run_id
+    challenger_run_id = challenger_run.run_id
+
+    champion_model_uri = f"runs:/{champion_run_id}/model"
+    challenger_model_uri = f"runs:/{challenger_run_id}/model"
+
+    # Declaramos el nombre del modelo registrado
+    model_name = "arturo-prefect-model"
+
+    # Registramos el Champion
+    champion_model_version = mlflow.register_model(champion_model_uri, model_name)
+    client.set_registered_model_alias(model_name, "champion", champion_model_version.version)
+
+    # Registramos el Challenger
+    challenger_model_version = mlflow.register_model(challenger_model_uri, model_name)
+    client.set_registered_model_alias(model_name, "challenger", challenger_model_version.version)
 
 # Definimos el flow principal
 @flow(name="Pipeline de Entrenamiento y Registro de Modelos")
 def pipeline_entrenamiento(jornada_actual: int):
+    file_path ="LaLiga Dataset 2023-2024.xlsx"
+    jornada_actual = 12
     # Inicializamos MLflow y DagsHub
     dagshub.init(url="https://dagshub.com/arturotowers/Proyecto_LaLiga", mlflow=True)
-    mlflow.set_experiment("LaLiga_Experiment")
+    MLFLOW_TRACKING_URI = mlflow.get_tracking_uri()
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment(experiment_name="arturo-prefect-experiment")
 
-    # Actualizamos el dataset con los resultados de la jornada pasada
-    actualizar_dataset(jornada_actual - 1)
+    # Ejecutar las tareas de flujo
+    print("Ejecutando tarea: Actualizar dataset")
+    df = actualizar_dataset(file_path,jornada_actual)
 
-    # Preparamos los datos para predicción (opcional)
+    print("Ejecutando tarea: Preparar datos para prediccion")
     df_prediccion = preparar_datos_prediccion(jornada_actual)
 
     # Cargamos y procesamos el dataset
-    X_train, X_val, y_train, y_val = cargar_procesar_dataset()
+    print("Ejecutando tarea: Cargando y procesando el dataset")
+    X_train, X_test, y_train, y_test = cargar_procesar_dataset(df)
 
-    # Definimos los modelos y sus distribuciones de hiperparámetros
-    models = [
-        (RandomForestClassifier, "RandomForest", {
-            'n_estimators': [100, 200, 300],
-            'max_depth': [None, 5, 10, 20],
-            'min_samples_split': [2, 5, 10],
-            'min_samples_leaf': [1, 2, 4],
-            'bootstrap': [True, False]
-        }),
-        (XGBClassifier, "XGBoost", {
-            'learning_rate': [0.01, 0.1, 0.2],
-            'max_depth': [3, 6, 10],
-            'n_estimators': [100, 200, 300],
-            'subsample': [0.5, 0.7, 1.0],
-            'colsample_bytree': [0.5, 0.7, 1.0]
-        }),
-        (SVC, "SVC", {
-            'C': [0.1, 1, 10],
-            'kernel': ['linear', 'rbf', 'poly'],
-            'gamma': ['scale', 'auto'],
-            'probability': [True]
-        })
-    ]
+    print("Ejecutando tarea: hyper-parameter tuning")
+    best_params_xgb, best_params_rf = hyper_parameter_tunning(X_train, X_test, y_train, y_test)
 
-    resultados = []
+    print("Ejecutando tarea: train best models")
+    train_best_model(X_train, X_test, y_train, y_test, best_params_xgb, best_params_rf)
 
-    # Entrenamos los modelos
-    for model_class, model_name, param_distributions in models:
-        accuracy, run_id, model_name = entrenar_modelo(
-            X_train, X_val, y_train, y_val,
-            model_class, model_name, param_distributions, n_iter=10
-        )
-        resultados.append((accuracy, run_id, model_name))
+    print("Ejecutando tarea: register best model")
+    register_best_model()
 
-    # Comparar modelos y asignar alias
-    comparar_modelos(resultados)
+    print("Flujo completado con éxito.")
+
 
 if __name__ == "__main__":
-    pipeline_entrenamiento(jornada_actual=13)
-
-
+    pipeline_entrenamiento(jornada_actual=15)

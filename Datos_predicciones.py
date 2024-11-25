@@ -2,13 +2,15 @@ import pandas as pd
 import re
 import dagshub
 import mlflow
-dagshub.init(url="https://dagshub.com/JuanPab2009/ProyectoFinalCD", mlflow=True)
+from sklearn.preprocessing import StandardScaler
+
+dagshub.init(url="https://dagshub.com/arturotowers/Proyecto_LaLiga", mlflow=True)
 # mlflow.set_tracking_uri("https://dagshub.com/JuanPab2009/ProyectoFinalCD.mlflow")
 
 # mlflow.set_experiment(experiment_name="nyc-taxi-experiment-prefect")
 
 # Seleccionamos el número de la jornada
-jornada = 12
+jornada = 13
 
 url= "https://fbref.com/es/comps/12/horario/Resultados-y-partidos-en-La-Liga"
 tables = pd.read_html(url)
@@ -103,6 +105,7 @@ df_opp.rename(columns=dict(zip(columns_to_rename, new_column_names_opp)), inplac
 df = pd.merge(df, df_opp, left_on='Adversario', right_on='Equipo', how='left')
 df = pd.merge(df, df_tm, left_on='Anfitrion', right_on='Equipo', how='left')
 df=df.drop(['Equipo_x','Equipo_y'],axis=1)
+df = df.dropna()
 
 predicted_df=df[['Día','Sedes','Edad(opp)','Pos.(opp)', 'Ass(opp)', 'TPint(opp)',
       'PrgC(opp)', 'PrgP(opp)','% de TT(opp)', 'Dist(opp)', '% Cmp(opp)', 'Dist. tot.(opp)','TklG(opp)', 'Int(opp)',
@@ -111,14 +114,20 @@ predicted_df=df[['Día','Sedes','Edad(opp)','Pos.(opp)', 'Ass(opp)', 'TPint(opp)
       '% de TT(tm)', 'Dist(tm)', '% Cmp(tm)', 'Dist. tot.(tm)', 'TklG(tm)','Int(tm)', 'Err(tm)', 'RL(tm)', 'PG(tm)',
       'PE(tm)', 'PP(tm)', 'GF(tm)','GC(tm)', 'xG(tm)', 'xGA(tm)', 'Últimos 5(tm)','Máximo Goleador del Equipo(tm)']]
 
-logged_model = 'runs:/e8e41ab35bd34545a81ccb039080a64c/model'
+sc = StandardScaler()
+predicted_df = sc.fit_transform(predicted_df)
+
+logged_model = 'runs:/f3fd20db564f44ea85090990dd18e887/models'
 
 # Load model as a PyFuncModel.
 loaded_model = mlflow.pyfunc.load_model(logged_model)
 
-# Predict on a Pandas DataFrame.
-import pandas as pd
-a = pd.DataFrame(loaded_model.predict(pd.DataFrame(predicted_df)))
-a['Anfitrion']=df['Anfitrion']
-a['Rival']=df['Adversario']
-print(a)
+# Predict probabilities on a Pandas DataFrame.
+probabilities = loaded_model.predict(pd.DataFrame(predicted_df))
+
+# Convert to DataFrame and add team information
+# prob_df = pd.DataFrame(probabilities)
+# prob_df['Anfitrion'] = df['Anfitrion']
+# prob_df['Rival'] = df['Adversario']
+
+print(probabilities)
